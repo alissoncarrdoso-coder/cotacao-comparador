@@ -58,7 +58,7 @@ export default function HistoryList({ initialComparisons }) {
             <div className="flex-1 min-w-0">
               <h2 className="font-semibold text-slate-900 truncate">{comparison.title}</h2>
               <p className="text-xs text-slate-500 mt-1">
-                {new Date(comparison.created_at).toLocaleString('pt-BR')}
+                Atualizada em {new Date(comparison.updated_at || comparison.created_at).toLocaleString('pt-BR')}
               </p>
               <div className="flex flex-wrap gap-x-5 gap-y-1 mt-3 text-sm text-slate-600">
                 <span><strong>{comparison.supplier_count}</strong> fornecedores</span>

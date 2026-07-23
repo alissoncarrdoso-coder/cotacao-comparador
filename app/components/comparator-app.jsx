@@ -4,7 +4,13 @@ import { useRef, useState } from 'react'
 import AppHeader from './app-header'
 import ComparisonResults from './comparison-results'
 import UploadPanel from './upload-panel'
-import { createComparisonCsv, getSuppliers, sortGroups } from '../../lib/comparison'
+import {
+  buildLocalGroups,
+  createComparisonCsv,
+  getSuppliers,
+  mergeQuoteIntoComparison,
+  sortGroups,
+} from '../../lib/comparison'
 
 const MAX_FILES = 10
 const MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -26,6 +32,35 @@ function defaultComparisonTitle() {
   }).format(new Date())}`
 }
 
+function ensureComparisonIds(value) {
+  if (!value) return null
+  return {
+    ...value,
+    quotes: (value.quotes || []).map((quote) => ({
+      ...quote,
+      id: quote.id || crypto.randomUUID(),
+    })),
+    groups: (value.groups || []).map((group) => ({
+      ...group,
+      id: group.id || crypto.randomUUID(),
+      quantity: Number(group.quantity || group.items?.[0]?.quantity || 1),
+      notes: group.notes || '',
+      items: [...(group.items || [])],
+    })),
+  }
+}
+
+function parseMoneyInput(value) {
+  let normalized = String(value || '')
+    .trim()
+    .replace(/[^0-9,.-]/g, '')
+  if (normalized.includes(',')) {
+    normalized = normalized.replace(/\./g, '').replace(',', '.')
+  }
+  const parsed = Number(normalized)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+}
+
 export default function ComparatorApp({
   accessProtected = false,
   authMode = 'public',
@@ -37,14 +72,17 @@ export default function ComparatorApp({
   const [files, setFiles] = useState([])
   const [stage, setStage] = useState(initialComparison ? 'done' : 'idle')
   const [progress, setProgress] = useState({ current: 0, total: 0 })
-  const [comparison, setComparison] = useState(initialComparison)
+  const [comparison, setComparison] = useState(() => ensureComparisonIds(initialComparison))
   const [comparisonId, setComparisonId] = useState(initialComparisonId)
   const [saveState, setSaveState] = useState(initialComparisonId ? 'saved' : 'idle')
   const [saveError, setSaveError] = useState('')
   const [error, setError] = useState('')
   const [sortBy, setSortBy] = useState('name')
   const [sortDir, setSortDir] = useState('asc')
+  const [importState, setImportState] = useState('idle')
+  const [processingInfo, setProcessingInfo] = useState(initialComparison?.meta || null)
   const inputRef = useRef(null)
+  const importInputRef = useRef(null)
 
   function addFiles(incoming) {
     const pdfs = Array.from(incoming).filter((file) => (
@@ -99,6 +137,7 @@ export default function ComparatorApp({
     setError('')
     setSortBy('name')
     setSortDir('asc')
+    setProcessingInfo(null)
   }
 
   function toggleSort(column) {
@@ -110,23 +149,29 @@ export default function ComparatorApp({
     }
   }
 
-  async function saveComparison(result) {
-    if (!historyEnabled) return
+  function markChanged(nextComparison) {
+    setComparison(nextComparison)
+    setSaveState(historyEnabled ? 'dirty' : 'idle')
+    setSaveError('')
+  }
+
+  async function saveComparison(result = comparison) {
+    if (!historyEnabled || !result) return
 
     setSaveState('saving')
     setSaveError('')
 
     try {
-      const response = await fetch('/api/comparisons', {
-        method: 'POST',
+      const response = await fetch(comparisonId ? `/api/comparisons/${comparisonId}` : '/api/comparisons', {
+        method: comparisonId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          title: defaultComparisonTitle(),
+          ...(!comparisonId ? { title: defaultComparisonTitle() } : {}),
           comparison: result,
         }),
       })
       const data = await readJsonResponse(response)
-      setComparisonId(data.comparison.id)
+      if (!comparisonId) setComparisonId(data.comparison.id)
       setSaveState('saved')
     } catch (err) {
       setSaveError(err.message)
@@ -169,14 +214,34 @@ export default function ComparatorApp({
     setStage('normalizing')
 
     try {
-      const response = await fetch('/api/normalize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quotes }),
-      })
-      const normalized = await readJsonResponse(response)
-      const result = { quotes, groups: normalized.groups }
+      const local = buildLocalGroups(quotes)
+      let groups = local.groups
+      let mode = 'local'
+
+      if (quotes.length > 1 && local.confidence < 0.58) {
+        const response = await fetch('/api/normalize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ quotes }),
+        })
+        const normalized = await readJsonResponse(response)
+        groups = normalized.groups.map((group) => ({
+          ...group,
+          id: crypto.randomUUID(),
+          quantity: Number(group.items?.[0]?.quantity || 1),
+          notes: '',
+        }))
+        mode = 'hybrid-ai'
+      }
+
+      const meta = {
+        processingMode: mode,
+        localConfidence: Number(local.confidence.toFixed(2)),
+        createdAt: new Date().toISOString(),
+      }
+      const result = ensureComparisonIds({ quotes, groups, meta })
       setComparison(result)
+      setProcessingInfo(meta)
       setStage('done')
       await saveComparison(result)
     } catch (err) {
@@ -202,6 +267,127 @@ export default function ComparatorApp({
     URL.revokeObjectURL(url)
   }
 
+  function updateSupplier(supplierId, supplier) {
+    markChanged({
+      ...comparison,
+      quotes: comparison.quotes.map((quote) => quote.id === supplierId ? { ...quote, supplier } : quote),
+      groups: comparison.groups.map((group) => ({
+        ...group,
+        items: group.items.map((item) => item.source_id === supplierId ? { ...item, source: supplier } : item),
+      })),
+    })
+  }
+
+  function addSupplier() {
+    const id = crypto.randomUUID()
+    markChanged({
+      ...comparison,
+      quotes: [...comparison.quotes, {
+        id,
+        supplier: `Fornecedor ${comparison.quotes.length + 1}`,
+        fileName: 'Cotação manual',
+        manual: true,
+        items: [],
+      }],
+    })
+  }
+
+  function removeSupplier(supplierId) {
+    if (!window.confirm('Remover este fornecedor e todos os preços vinculados?')) return
+    markChanged({
+      ...comparison,
+      quotes: comparison.quotes.filter((quote) => quote.id !== supplierId),
+      groups: comparison.groups.map((group) => ({
+        ...group,
+        items: group.items.filter((item) => item.source_id !== supplierId),
+      })),
+    })
+  }
+
+  function addGroup() {
+    markChanged({
+      ...comparison,
+      groups: [...comparison.groups, {
+        id: crypto.randomUUID(),
+        normalized_name: 'Novo item',
+        unit: 'un',
+        quantity: 1,
+        notes: '',
+        items: [],
+      }],
+    })
+  }
+
+  function updateGroup(groupId, field, value) {
+    markChanged({
+      ...comparison,
+      groups: comparison.groups.map((group) => group.id === groupId
+        ? { ...group, [field]: field === 'quantity' ? Math.max(0, Number(value || 0)) : value }
+        : group),
+    })
+  }
+
+  function removeGroup(groupId) {
+    if (!window.confirm('Remover este item da comparação?')) return
+    markChanged({
+      ...comparison,
+      groups: comparison.groups.filter((group) => group.id !== groupId),
+    })
+  }
+
+  function updatePrice(groupId, supplierId, rawValue) {
+    const unitPrice = parseMoneyInput(rawValue)
+    const supplier = comparison.quotes.find((quote) => quote.id === supplierId)
+
+    markChanged({
+      ...comparison,
+      groups: comparison.groups.map((group) => {
+        if (group.id !== groupId) return group
+        const existing = group.items.find((item) => item.source_id === supplierId)
+        const remaining = group.items.filter((item) => item.source_id !== supplierId)
+        if (!unitPrice) return { ...group, items: remaining }
+
+        return {
+          ...group,
+          items: [...remaining, {
+            source_id: supplierId,
+            source: supplier?.supplier || supplier?.fileName || 'Fornecedor',
+            unit_price: unitPrice,
+            quantity: Number(group.quantity || existing?.quantity || 1),
+            total_price: unitPrice * Number(group.quantity || existing?.quantity || 1),
+          }],
+        }
+      }),
+    })
+  }
+
+  async function importQuote(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (file.size > MAX_FILE_SIZE) {
+      setSaveError('O PDF deve ter no máximo 10 MB.')
+      setSaveState('error')
+      return
+    }
+
+    setImportState('processing')
+    setSaveError('')
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const response = await fetch('/api/process-pdf', { method: 'POST', body: formData })
+      const quote = await readJsonResponse(response)
+      const next = mergeQuoteIntoComparison(comparison, { ...quote, id: crypto.randomUUID() })
+      markChanged(next)
+      setImportState('done')
+    } catch (err) {
+      setSaveError(`Não foi possível importar a cotação: ${err.message}`)
+      setSaveState('error')
+      setImportState('error')
+    }
+  }
+
   return (
     <div className="min-h-screen bg-slate-50">
       <AppHeader
@@ -213,7 +399,7 @@ export default function ComparatorApp({
         userEmail={userEmail}
       />
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8">
+      <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-8">
         {!comparison ? (
           <UploadPanel
             files={files}
@@ -227,16 +413,30 @@ export default function ComparatorApp({
             onProcess={processAll}
           />
         ) : (
-          <ComparisonResults
-            comparison={comparison}
-            comparisonId={comparisonId}
-            saveState={saveState}
-            saveError={saveError}
-            historyEnabled={historyEnabled}
-            sortBy={sortBy}
-            sortDir={sortDir}
-            onSort={toggleSort}
-          />
+          <>
+            <input ref={importInputRef} type="file" accept="application/pdf,.pdf" className="hidden" onChange={importQuote} />
+            <ComparisonResults
+              comparison={comparison}
+              comparisonId={comparisonId}
+              saveState={saveState}
+              saveError={saveError}
+              historyEnabled={historyEnabled}
+              sortBy={sortBy}
+              sortDir={sortDir}
+              importState={importState}
+              processingInfo={processingInfo}
+              onSort={toggleSort}
+              onSave={() => saveComparison(comparison)}
+              onAddGroup={addGroup}
+              onUpdateGroup={updateGroup}
+              onRemoveGroup={removeGroup}
+              onAddSupplier={addSupplier}
+              onUpdateSupplier={updateSupplier}
+              onRemoveSupplier={removeSupplier}
+              onUpdatePrice={updatePrice}
+              onImport={() => importInputRef.current?.click()}
+            />
+          </>
         )}
       </main>
 

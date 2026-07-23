@@ -1,39 +1,9 @@
 import { NextResponse } from 'next/server'
 import { getAccessContext } from '../../../lib/access'
-import { getBestQuote, getSuppliers } from '../../../lib/comparison'
-import {
-  cleanText,
-  sanitizeGroups,
-  sanitizeQuotesInput,
-} from '../../../lib/validation'
+import { cleanText } from '../../../lib/validation'
+import { calculateMetrics, normalizeComparison } from '../../../lib/comparison-persistence'
 
 export const runtime = 'nodejs'
-
-function normalizeComparison(input) {
-  const quotes = sanitizeQuotesInput(input?.quotes)
-  const validSourceIds = new Set(quotes.map((quote) => quote.id))
-  const groups = sanitizeGroups(input?.groups, validSourceIds)
-
-  if (!groups.length) {
-    throw new Error('A comparação não possui grupos válidos')
-  }
-
-  return { quotes, groups }
-}
-
-function calculateMetrics(comparison) {
-  const suppliers = getSuppliers(comparison)
-  const maxSavings = comparison.groups.reduce((total, group) => {
-    const { best, worst } = getBestQuote(group, suppliers)
-    return total + (best === null || worst === null ? 0 : worst - best)
-  }, 0)
-
-  return {
-    supplierCount: suppliers.length,
-    itemCount: comparison.groups.length,
-    maxSavings: Number(maxSavings.toFixed(2)),
-  }
-}
 
 export async function GET() {
   const access = await getAccessContext()
@@ -46,8 +16,8 @@ export async function GET() {
 
   const { data, error } = await access.supabase
     .from('comparisons')
-    .select('id,title,supplier_count,item_count,max_savings,created_at')
-    .order('created_at', { ascending: false })
+    .select('id,title,supplier_count,item_count,max_savings,created_at,updated_at')
+    .order('updated_at', { ascending: false })
     .limit(100)
 
   if (error) {
@@ -99,3 +69,4 @@ export async function POST(request) {
     return NextResponse.json({ error: message }, { status: 400 })
   }
 }
+

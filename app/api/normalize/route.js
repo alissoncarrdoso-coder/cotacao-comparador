@@ -72,7 +72,7 @@ Retorne somente JSON válido:
     const text = response.content.find((content) => content.type === 'text')?.text
     const parsed = parseModelJson(text)
     const validSourceIds = new Set(quotes.map((quote) => quote.id))
-    const groups = sanitizeGroups(parsed?.groups, validSourceIds)
+    const groups = sanitizeGroups(parsed?.groups, validSourceIds, { allowEmpty: false })
 
     if (!groups.length) {
       return NextResponse.json({ error: 'Não foi possível formar grupos de comparação' }, { status: 422 })

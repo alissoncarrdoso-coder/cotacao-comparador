@@ -13,8 +13,8 @@ export default async function HistoryPage() {
 
   const { data, error } = await access.supabase
     .from('comparisons')
-    .select('id,title,supplier_count,item_count,max_savings,created_at')
-    .order('created_at', { ascending: false })
+    .select('id,title,supplier_count,item_count,max_savings,created_at,updated_at')
+    .order('updated_at', { ascending: false })
     .limit(100)
 
   return (
